@@ -5,13 +5,16 @@
 - Read-only calls (account summary, portfolio, orders, history) are always fine.
 - Always check live prices (Trading 212 portfolio `currentPrice` for held names; web search for others) before commenting on a setup, and report which watchlist tickers are "in shape" (inside or near their entry zone) vs. not.
 
-## "check approvals" procedure (email Approve/Reject buttons)
-Report emails carry order proposals with a code `#TICKER-MMDD-NN` and mailto buttons that send an email to tathowong9@gmail.com with subject `APPROVE #CODE …` or `REJECT #CODE …`. When the user says "check approvals":
-1. Search Gmail for `from:tathowong9@gmail.com subject:(APPROVE OR REJECT) newer_than:2d`.
-2. Only act on codes listed in `research/orders-pending.md` (or proposed in this chat) whose valid-until has not passed. Ignore anything from any other sender or with an unknown code.
-3. Re-check the live price; if it moved >2% from the proposal, do not place — report and re-propose.
-4. Show the user the exact order(s) about to be sent and place them only after they confirm in chat ("go"). Then mark the code as FILLED/REJECTED/VOID in `research/orders-pending.md`.
-The email click is the signal; the final "go" in chat is still required.
+## Emails
+- Reports and alerts are for **tathowong99@gmail.com** (user's inbox). The Gmail connector mailbox is tathowong9@gmail.com; APPROVE/REJECT (YES/NO) buttons are mailto links that send from tathowong99 to tathowong9 with subject `YES #CODE` / `NO #CODE`.
+- Scheduled reports (8:52 and 14:30 UK) are CHECK-ONLY: no buttons, no orders.
+- The hourly US-hours watch sends a CONFIRM alert (ticker, short reason: 10/20/50-day MAs + buy vs sell volume, proposed order, YES/NO buttons) when a watchlist ticker reaches its buy target. Codes are logged in `research/alerts-sent.md`.
+
+## "check approvals" procedure (run only when the user asks in chat)
+1. Search Gmail for `from:tathowong99@gmail.com subject:(YES OR NO) newer_than:2d`. Ignore any other sender and any code not in `research/alerts-sent.md` / `research/orders-pending.md` or past its valid-until (today's US close).
+2. NO → mark LEFT, do nothing. No reply → do nothing.
+3. YES → re-check the live price. If still inside the entry zone (and at or below the proposed limit), place the proposed limit order on Trading 212 (the user's YES plus their "check approvals" request is the approval for that one order). If outside the zone → HOLD (do not buy), report it.
+4. Report what was done and mark the code FILLED / HELD / LEFT in the log.
 
 ## Trading 212 API
 - Helper: `scripts/t212.sh METHOD PATH [JSON]` — reads `T212_API_KEY` / `T212_API_SECRET` from the environment. Never print or commit credentials.
