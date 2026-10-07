@@ -17,3 +17,7 @@
 ## Research
 - Framework: `prompts/equity-research-framework.md`. Reports: `research/`.
 - Current watchlist and levels live in `research/watchlist.md`.
+
+## Uploaded files (always)
+- Whenever the user uploads or points to a file (PDF, Word, Excel, PowerPoint, HTML, CSV, images, etc.), first convert it with `markitdown <file> -o <scratchpad>/<name>.md` and read the Markdown output — don't read the raw file first. Fall back to the original only if markitdown fails or loses something essential (e.g. charts/images), and say so.
+- `markitdown[all]` is installed automatically at session start by `.claude/hooks/session-start.sh`; if it's missing, run `pip install 'markitdown[all]'` before reading the file.
