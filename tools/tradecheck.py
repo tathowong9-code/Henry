@@ -148,7 +148,7 @@ def utc_now(text=None):
         if t.tzinfo:
             return t.astimezone(dt.timezone.utc).replace(tzinfo=None)
         return ny_to_utc(t)
-    return dt.datetime.utcnow()
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
 
 def trading_day(d):
@@ -1040,7 +1040,7 @@ def spark(symbols, pause=0.3):
 def news(sym, hours=72):
     text = http_get("https://feeds.finance.yahoo.com/rss/2.0/headline?s=%s&region=US&lang=en-US" % ysym(sym))
     items = []
-    cutoff = dt.datetime.utcnow() - dt.timedelta(hours=hours)
+    cutoff = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(hours=hours)
     for it in re.findall(r"<item>(.*?)</item>", text, re.S):
         g = lambda tag: (re.search(r"<%s>(.*?)</%s>" % (tag, tag), it, re.S) or [None, ""])[1]
         title = H.unescape(re.sub(r"<!\[CDATA\[|\]\]>", "", g("title"))).strip()
@@ -1094,12 +1094,15 @@ def sec_quarters(sym, ua, n=6):
     gaap = (doc.get("facts") or {}).get("us-gaap") or {}
 
     def q(tags, unit):
+        """The tag whose quarterly frames run latest (companies switch revenue tags over the years)."""
+        best, best_end = {}, ""
         for t in tags:
             vals = ((gaap.get(t) or {}).get("units") or {}).get(unit) or []
             fr = {v["frame"]: v for v in vals if re.fullmatch(r"CY\d{4}Q\d", v.get("frame", ""))}
-            if fr:
-                return fr
-        return {}
+            end = max((v["end"] for v in fr.values()), default="")
+            if end > best_end:
+                best, best_end = fr, end
+        return best
     rev, ni = q(REV_TAGS, "USD"), q(["NetIncomeLoss"], "USD")
     eps, gp = q(["EarningsPerShareDiluted"], "USD/shares"), q(["GrossProfit"], "USD")
     frames = sorted(set(rev) | set(ni) | set(eps), key=lambda f: (int(f[2:6]), int(f[7])))[-n:]
@@ -1120,7 +1123,7 @@ def sec_quarters(sym, ua, n=6):
 def yahoo_earnings_date(sym):
     """Best effort; Yahoo often wants a cookie for this. Returns 'YYYY-MM-DD' or None."""
     try:
-        doc = yahoo("/v7/finance/quote?symbols=%s" % ysym(sym))
+        doc = json.loads(http_get(YAHOO[0] + "/v7/finance/quote?symbols=%s" % ysym(sym), timeout=8))  # one quick try
         r = ((doc.get("quoteResponse") or {}).get("result") or [{}])[0]
         ts = r.get("earningsTimestampStart") or r.get("earningsTimestamp")
         return ts_to_ny(ts).date().isoformat() if ts else None
@@ -1244,8 +1247,11 @@ def entry_run(a, cfg, now, fx):
     sym = a.ticker.upper()
     bars, info = get_bars(sym, a, now)
     S = Series(bars)
-    today = to_ny(now).date().isoformat()
-    k = len(bars) - 2 if bars[-1]["d"] == today else len(bars) - 1   # judge the chart on completed days
+    ny = to_ny(now)
+    today = ny.date().isoformat()
+    sess = session(ny.date())
+    live_today = bool(sess) and ny.time() < sess[1]          # today's session not finished yet
+    k = len(bars) - 2 if (bars[-1]["d"] == today and live_today) else len(bars) - 1   # judge on completed days
     st = state_at(S, k)
     prev = bars[k]
     mode = a.setup
@@ -1261,8 +1267,15 @@ def entry_run(a, cfg, now, fx):
     zone = st["zone"]
     if mode == "zone" and not zone:
         raise DataError("no buy zone yet (needs 20 days of bars)")
-    b5, _ = intraday(sym, a)
-    ev = entry_eval(b5, now, mode, level, zone, cfg)
+    if live_today:
+        b5, _ = intraday(sym, a)
+        ev = entry_eval(b5, now, mode, level, zone, cfg)
+    else:   # after the close, a weekend or a holiday: plan the next session
+        nxt = next_trading_days(today, 1)[0]
+        d = dt.date.fromisoformat(nxt)
+        ev = {"mode": mode, "status": "next", "level": level, "zone": zone, "trigger": None, "forming": None,
+              "reason": "planned for %s (the next session)" % d.strftime("%a %d %b"),
+              "window": (dt.datetime.combine(d, _hm(cfg["entry_from"])), dt.datetime.combine(d, _hm(cfg["entry_until"])))}
     level = ev["level"]
     if ev["trigger"]:
         entry = ev["trigger"]["c"]
@@ -1292,7 +1305,7 @@ def entry_text(r, cfg):
         z = ev["zone"]
         L.append("  Zone     $%.2f-%.2f (£%.2f-%.2f)" % (z[0], z[1], z[0] / fx, z[1] / fx))
     status = {"waiting": "WAITING", "triggered": "TRIGGERED", "expired": "EXPIRED", "pre-open": "NOT OPEN YET",
-              "closed": "MARKET CLOSED"}[ev["status"]]
+              "closed": "MARKET CLOSED", "next": "NEXT SESSION"}[ev["status"]]
     if ev["trigger"]:
         b = ev["trigger"]
         L.append("  %s at %s: $%.2f (£%.2f). %s." % (status, ny_uk(b["end"]), b["c"], b["c"] / fx, ev["reason"][0].upper() + ev["reason"][1:]))
@@ -1354,7 +1367,7 @@ def entry_watch(a, cfg, fx):
     print("Watching %s on 5-minute bars. Keep this Mac awake and online. Ctrl-C to stop." % a.ticker.upper(), flush=True)
     errors = 0
     while True:
-        now = utc_now(a.now) if a.now else dt.datetime.utcnow()
+        now = utc_now(a.now) if a.now else dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         try:
             r = entry_run(a, cfg, now, fx)
             errors = 0
