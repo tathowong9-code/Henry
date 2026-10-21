@@ -1120,281 +1120,47 @@ def sec_quarters(sym, ua, n=6):
     return rows
 
 
-def yahoo_earnings_date(sym):
-    """Best effort; Yahoo often wants a cookie for this. Returns 'YYYY-MM-DD' or None."""
+def _date_from_text(text):
+    m = re.search(r"([A-Z][a-z]{2})[a-z]*\.? (\d{1,2}), (\d{4})", text or "")
+    if not m:
+        return None
     try:
-        doc = json.loads(http_get(YAHOO[0] + "/v7/finance/quote?symbols=%s" % ysym(sym), timeout=8))  # one quick try
-        r = ((doc.get("quoteResponse") or {}).get("result") or [{}])[0]
-        ts = r.get("earningsTimestampStart") or r.get("earningsTimestamp")
-        return ts_to_ny(ts).date().isoformat() if ts else None
-    except Exception:
+        return dt.datetime.strptime("%s %s %s" % m.groups(), "%b %d %Y").date().isoformat()
+    except ValueError:
         return None
 
 
-
-# ================================================================ entry timer (trader-entry, swing version)
-
-STEP5 = 300
-
-
-def _hm(text):
-    h, mi = text.split(":")
-    return dt.time(int(h), int(mi))
-
-
-def intraday_from_chart(doc, sym):
-    res = ((doc or {}).get("chart") or {}).get("result")
-    if not res:
-        raise DataError("no 5-minute data for %s" % sym)
-    r = res[0]
-    t = r.get("timestamp") or []
-    q = ((r.get("indicators") or {}).get("quote") or [{}])[0]
-    col = lambda k: (q.get(k) or []) + [None] * len(t)
-    o, h, l, c, v = col("open"), col("high"), col("low"), col("close"), col("volume")
-    out = []
-    for i, ts in enumerate(t):
-        if ts % STEP5 or None in (o[i], h[i], l[i], c[i]):
-            continue  # Yahoo's live tick (10:49:45) is not a bar
-        out.append({"t": ts, "o": o[i], "h": h[i], "l": l[i], "c": c[i], "v": v[i] or 0})
-    return out, (r.get("meta") or {}).get("regularMarketTime")
-
-
-def intraday(sym, a):
-    if a.data:
-        p = os.path.join(a.data, sym.upper() + "_5m.json")
-        if not os.path.exists(p):
-            return [], None
-        with open(p) as f:
-            return intraday_from_chart(json.load(f), sym)
-    return intraday_from_chart(yahoo("/v8/finance/chart/%s?range=1d&interval=5m&includePrePost=false" % ysym(sym)), sym)
-
-
-def entry_eval(bars5, now_utc, mode, level, zone, cfg):
-    """The first COMPLETED 5-minute bar that confirms the entry. A wick is not a trigger."""
-    local = to_ny(now_utc)
-    day = local.date()
-    res = {"mode": mode, "status": "waiting", "reason": "", "level": level, "zone": zone, "trigger": None,
-           "last": None, "forming": None, "orb": None}
-    s = session(day)
-    if not s:
-        res.update(status="closed", reason="the NYSE is closed today")
-        return res
-    open_dt, close_dt = dt.datetime.combine(day, s[0]), dt.datetime.combine(day, s[1])
-    before = dt.datetime.combine(day, _hm(cfg["entry_from"]))
-    cutoff = min(dt.datetime.combine(day, _hm(cfg["entry_until"])), close_dt - dt.timedelta(minutes=30))
-    res["window"] = (before, cutoff)
-    if local < open_dt:
-        res.update(status="pre-open", reason="the NYSE opens at 9:30 New York")
-        return res
-    closed = []
-    for b in bars5:
-        et = ts_to_ny(b["t"])
-        if et.date() != day or not (open_dt <= et < close_dt):
-            continue
-        end = et + dt.timedelta(seconds=STEP5)
-        if end <= local:
-            closed.append(dict(b, et=et, end=end))
-        elif et <= local:
-            res["forming"] = {"start": et, "price": b["c"]}
-    if mode == "orb":
-        rng = [b for b in closed if b["et"] < open_dt + dt.timedelta(minutes=15)]
-        if local < open_dt + dt.timedelta(minutes=15) or not rng:
-            res.update(reason="the 15-minute opening range is still forming")
-            return res
-        res["orb"] = (max(b["h"] for b in rng), min(b["l"] for b in rng))
-        level = res["level"] = res["orb"][0]
-    if closed:
-        res["last"] = closed[-1]
-    for b in closed:
-        if b["end"] < before or b["end"] > cutoff:
-            continue
-        if mode in ("orb", "level") and b["c"] > level:
-            res.update(status="triggered", trigger=b, reason="the %s bar closed above $%.2f" % (b["et"].strftime("%H:%M"), level))
-            return res
-        if mode == "zone" and b["l"] <= zone[1] and b["c"] >= zone[0]:
-            res.update(status="triggered", trigger=b,
-                       reason="the %s bar traded into the zone and closed at $%.2f, inside it" % (b["et"].strftime("%H:%M"), b["c"]))
-            return res
-    if local >= cutoff:
-        res.update(status="expired", reason="no trigger by %s New York, the last time for a new entry" % cutoff.strftime("%H:%M"))
-        return res
-    if not closed:
-        res["reason"] = "no completed 5-minute bar yet"
-    elif mode == "zone":
-        c = closed[-1]["c"]
-        res["reason"] = "last close $%.2f, %s the zone $%.2f-%.2f" % (c, "above" if c > zone[1] else "below", zone[0], zone[1])
-    else:
-        c = closed[-1]["c"]
-        res["reason"] = "last close $%.2f, $%.2f %s the trigger $%.2f (%+.2f%%)" % (
-            c, abs(level - c), "under" if c <= level else "over", level, (c / level - 1) * 100)
-    return res
-
-
-def ny_uk(local_ny):
-    return "%s New York / %s UK" % (local_ny.strftime("%H:%M"), to_uk(ny_to_utc(local_ny)).strftime("%H:%M"))
-
-
-def notify_mac(title, text):
-    if sys.platform == "darwin":
+def yahoo_earnings_date(sym):
+    """Next earnings date, best effort: Nasdaq first, then Yahoo (needs a cookie and crumb).
+    Returns 'YYYY-MM-DD' or None. Needs api.nasdaq.com, or fc.yahoo.com, reachable."""
+    try:
+        doc = json.loads(http_get("https://api.nasdaq.com/api/analyst/%s/earnings-date" % ysym(sym),
+                                  {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                                                 "(KHTML, like Gecko) Chrome/129.0 Safari/537.36",
+                                   "Accept": "application/json, text/plain, */*"}, timeout=8))
+        d = _date_from_text(((doc or {}).get("data") or {}).get("announcement"))
+        if d:
+            return d
+    except Exception:
+        pass
+    try:
+        import http.cookiejar
+        jar = http.cookiejar.CookieJar()
+        op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        h = {"User-Agent": UA}
         try:
-            os.system("osascript -e %s >/dev/null 2>&1" % json.dumps(
-                'display notification %s with title %s sound name "Glass"' % (json.dumps(text), json.dumps(title))))
-        except Exception:
-            pass
-
-
-def entry_run(a, cfg, now, fx):
-    sym = a.ticker.upper()
-    bars, info = get_bars(sym, a, now)
-    S = Series(bars)
-    ny = to_ny(now)
-    today = ny.date().isoformat()
-    sess = session(ny.date())
-    live_today = bool(sess) and ny.time() < sess[1]          # today's session not finished yet
-    k = len(bars) - 2 if (bars[-1]["d"] == today and live_today) else len(bars) - 1   # judge on completed days
-    st = state_at(S, k)
-    prev = bars[k]
-    mode = a.setup
-    if not mode:
-        if st["verdict"] == "BUY ZONE":
-            mode = "level"
-        elif st["verdict"] in ("WAIT", "WATCH"):
-            mode = "zone"
-        else:
-            raise DataError("%s is %s (%d/%d trend checks): no entry plan for a weak chart. Use --setup to force one." % (
-                sym, st["verdict"], st["score"], st["of"]))
-    level = a.level if a.level else (floor_cent(prev["h"]) + 0.01 if mode == "level" else None)
-    zone = st["zone"]
-    if mode == "zone" and not zone:
-        raise DataError("no buy zone yet (needs 20 days of bars)")
-    if live_today:
-        b5, _ = intraday(sym, a)
-        ev = entry_eval(b5, now, mode, level, zone, cfg)
-    else:   # after the close, a weekend or a holiday: plan the next session
-        nxt = next_trading_days(today, 1)[0]
-        d = dt.date.fromisoformat(nxt)
-        ev = {"mode": mode, "status": "next", "level": level, "zone": zone, "trigger": None, "forming": None,
-              "reason": "planned for %s (the next session)" % d.strftime("%a %d %b"),
-              "window": (dt.datetime.combine(d, _hm(cfg["entry_from"])), dt.datetime.combine(d, _hm(cfg["entry_until"])))}
-    level = ev["level"]
-    if ev["trigger"]:
-        entry = ev["trigger"]["c"]
-    elif mode == "zone":
-        entry = zone[1]
-    else:
-        entry = level
-    plan = sz = None
-    if entry:
-        plan = make_plan(S, k, entry, a.stop or cfg["stop_rule"], a.target or ("%gR" % cfg["target_r"]))
-        sz = size(plan, fx, cfg)
-    return {"symbol": sym, "state": st, "prev": prev, "mode": mode, "ev": ev, "plan": plan, "size": sz, "fx": fx,
-            "entry": entry, "info": info}
-
-
-def entry_text(r, cfg):
-    st, ev, p, sz, fx, sym = r["state"], r["ev"], r["plan"], r["size"], r["fx"], r["symbol"]
-    L = []
-    what = {"level": "close above yesterday's high" if not r.get("custom") else "close above your level",
-            "orb": "close above the 15-minute opening range", "zone": "trade back into the buy zone"}[r["mode"]]
-    L.append("%s  %s chart (%d/%d) · %s · entry rule: first completed 5-minute bar to %s" % (
-        sym, st["verdict"], st["score"], st["of"], st["date"], what))
-    if r["mode"] in ("level", "orb") and ev["level"]:
-        L.append("  Trigger  $%.2f (£%.2f)%s" % (ev["level"], ev["level"] / fx,
-                 "  = yesterday's high %.2f + 1 cent" % r["prev"]["h"] if r["mode"] == "level" else ""))
-    if r["mode"] == "zone":
-        z = ev["zone"]
-        L.append("  Zone     $%.2f-%.2f (£%.2f-%.2f)" % (z[0], z[1], z[0] / fx, z[1] / fx))
-    status = {"waiting": "WAITING", "triggered": "TRIGGERED", "expired": "EXPIRED", "pre-open": "NOT OPEN YET",
-              "closed": "MARKET CLOSED", "next": "NEXT SESSION"}[ev["status"]]
-    if ev["trigger"]:
-        b = ev["trigger"]
-        L.append("  %s at %s: $%.2f (£%.2f). %s." % (status, ny_uk(b["end"]), b["c"], b["c"] / fx, ev["reason"][0].upper() + ev["reason"][1:]))
-    else:
-        L.append("  %s: %s." % (status, ev["reason"]))
-    if ev.get("forming"):
-        f = ev["forming"]
-        L.append("  The %s bar is still forming ($%.2f so far); it counts only once it closes." % (f["start"].strftime("%H:%M"), f["price"]))
-    if ev.get("window"):
-        w = ev["window"]
-        L.append("  Entry window: %s to %s." % (ny_uk(w[0]), ny_uk(w[1])))
-    if not p:
-        return "\n".join(L)
-    L.append("  Plan     entry $%.2f · stop $%.2f (%s, -%.1f%%) · target $%.2f (%s) · R:R %.2f" % (
-        p["entry"], p["stop"], p["stop_why"], p["risk_pct"], p["target"], p["target_why"], p["rr"]))
-    if sz["refused"]:
-        L.append("  Size     refused: " + sz["refused"])
-        return "\n".join(L)
-    qty = sz["qty"]
-    slip = cfg["entry_slippage_pct"] / 100.0
-    L.append("")
-    L.append("  Trading 212 order (you place it; this tool never does). Prices in USD as the order ticket shows them:")
-    if ev["status"] == "triggered":
-        L.append("    It has triggered. Market BUY %s shares now, or a Limit BUY at $%.2f to cap the price." % (m(qty), p["entry"] * (1 + slip)))
-    elif r["mode"] in ("level", "orb"):
-        L.append("    Stop-limit BUY %s shares · stop price $%.2f · limit price $%.2f · valid for the day" % (
-            m(qty), ev["level"], round_cent(ev["level"] * (1 + slip))))
-        L.append("    Trading 212 watches every tick and buys the moment the price reaches $%.2f, paying at most $%.2f." % (
-            ev["level"], round_cent(ev["level"] * (1 + slip))))
-    else:
-        L.append("    Limit BUY %s shares · limit price $%.2f · good till cancelled" % (m(qty), ev["zone"][1]))
-        L.append("    It fills only if the price comes back down to $%.2f or lower." % ev["zone"][1])
-    L.append("    After it fills: Stop SELL at $%.2f (your stop) and, if you like, Limit SELL at $%.2f (target)." % (p["stop"], p["target"]))
-    L.append("    About £%s with the 0.15%% FX fee · max loss £%s at the stop · size set by %s." % (
-        m(sz["cost_gbp"]), m(sz["max_loss_gbp"]), sz["decided_by"]))
-    L.append("    If Trading 212 won't take a fraction on this order type, round down to %d whole shares." % int(qty))
-    return "\n".join(L)
-
-
-def cmd_entry(a, cfg):
-    fx, fxsrc = get_fx(a, cfg)
-    if a.watch:
-        return entry_watch(a, cfg, fx)
-    r = entry_run(a, cfg, utc_now(a.now), fx)
-    r["custom"] = bool(a.level)
-    if a.json:
-        out = dict(r)
-        out.pop("info", None)
-        print(json.dumps(out, indent=1, default=str))
-    else:
-        print(entry_text(r, cfg))
-        print("\nFree Yahoo 5-minute bars can lag a minute or more; Trading 212's own stop-limit order watches every tick.")
-        print(NOTE)
-    return 0 if r["ev"]["status"] == "triggered" else 1
-
-
-def entry_watch(a, cfg, fx):
-    """Check after every 5-minute bar closes until it triggers or the window ends. Keep the Mac awake."""
-    print("Watching %s on 5-minute bars. Keep this Mac awake and online. Ctrl-C to stop." % a.ticker.upper(), flush=True)
-    errors = 0
-    while True:
-        now = utc_now(a.now) if a.now else dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-        try:
-            r = entry_run(a, cfg, now, fx)
-            errors = 0
-        except DataError as ex:
-            errors += 1
-            print("%s  data problem: %s" % (to_uk(now).strftime("%H:%M UK"), ex), flush=True)
-            if errors >= 5:
-                return 2
-            time.sleep(60)
-            continue
-        ev = r["ev"]
-        print("%s  %s" % (to_uk(now).strftime("%H:%M UK"), ev["status"].upper() + ": " + ev["reason"]), flush=True)
-        if ev["status"] == "triggered":
-            r["custom"] = bool(a.level)
-            print(entry_text(r, cfg), flush=True)
-            notify_mac("Entry: %s" % r["symbol"], "%s triggered at $%.2f" % (r["symbol"], ev["trigger"]["c"]))
-            return 0
-        if ev["status"] in ("expired", "closed") or a.now:
-            notify_mac("Entry: %s" % r["symbol"], ev["reason"])
-            return 1
-        ny = to_ny(now)
-        nxt = (ny.minute // 5 + 1) * 5
-        wait = (nxt - ny.minute) * 60 - ny.second + 20   # just after the next bar closes
-        if ev["status"] == "pre-open":
-            s = session(ny.date())
-            wait = max(wait, int((dt.datetime.combine(ny.date(), s[0]) - ny).total_seconds()) + 20)
-        time.sleep(max(30, wait))
+            op.open(urllib.request.Request("https://fc.yahoo.com", headers=h), timeout=8).read()
+        except urllib.error.HTTPError:
+            pass  # 404 is normal; it still sets the cookie
+        crumb = op.open(urllib.request.Request(YAHOO[1] + "/v1/test/getcrumb", headers=h), timeout=8).read().decode().strip()
+        doc = json.loads(op.open(urllib.request.Request(
+            YAHOO[1] + "/v10/finance/quoteSummary/%s?modules=calendarEvents&crumb=%s" % (ysym(sym), urllib.request.quote(crumb)),
+            headers=h), timeout=8).read())
+        ev = (((doc.get("quoteSummary") or {}).get("result") or [{}])[0].get("calendarEvents") or {}).get("earnings") or {}
+        ts = [x.get("raw") for x in ev.get("earningsDate") or [] if x.get("raw")]
+        return ts_to_ny(min(ts)).date().isoformat() if ts else None
+    except Exception:
+        return None
 
 
 # ================================================================ text output
